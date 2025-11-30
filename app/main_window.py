@@ -9,6 +9,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTextEdit,
     QLabel,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox
 )
 from PySide6.QtCore import Qt
 import webbrowser
@@ -16,9 +19,64 @@ from urllib.parse import quote_plus
 from app.google_routes import get_route_info, RouteError
 
 
+class CarConfigDialog(QDialog):
+    def __init__(self, parent=None, existing_config=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Saját jármű konfigurálása")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        # Autó neve (opcionális)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Pl. Saját autóm")
+        form.addRow("Autó neve:", self.name_input)
+
+        # Fogyasztás l/100km
+        self.consumption_input = QDoubleSpinBox()
+        self.consumption_input.setRange(1.0, 30.0)
+        self.consumption_input.setDecimals(1)
+        self.consumption_input.setSingleStep(0.1)
+        self.consumption_input.setValue(7.0)  # default
+        form.addRow("Átlagfogyasztás (l/100 km):", self.consumption_input)
+
+        # Üzemanyag ár Ft/liter
+        self.fuel_price_input = QDoubleSpinBox()
+        self.fuel_price_input.setRange(100.0, 2000.0)
+        self.fuel_price_input.setDecimals(0)
+        self.fuel_price_input.setSingleStep(10.0)
+        self.fuel_price_input.setValue(650.0)  # default pl. 650 Ft/l
+        form.addRow("Üzemanyag ár (Ft / liter):", self.fuel_price_input)
+
+        layout.addLayout(form)
+
+        # Ha volt már meglévő config, töltsük be
+        if existing_config:
+            self.name_input.setText(existing_config.get("name", ""))
+            self.consumption_input.setValue(existing_config.get("consumption_l_per_100km", 7.0))
+            self.fuel_price_input.setValue(existing_config.get("fuel_price_per_liter", 650.0))
+
+        # OK / Mégse gombok
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_config(self):
+        return {
+            "name": self.name_input.text().strip() or "Saját jármű",
+            "consumption_l_per_100km": float(self.consumption_input.value()),
+            "fuel_price_per_liter": float(self.fuel_price_input.value()),
+        }
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.car_config = None  # ide mentjük a felhasználó autójának beállítását (dict)
 
         self.setWindowTitle("Travelling Guidance")
         self.setMinimumSize(900, 600)
@@ -55,17 +113,26 @@ class MainWindow(QMainWindow):
         self.mode_combo.addItems([
             "Autó",
             "Tömegközlekedés",
-            "Gyalog",
-            "Kerékpár",
+            "Repülő",
         ])
         form_layout.addRow("Mivel:", self.mode_combo)
 
         left_layout.addLayout(form_layout)
 
-        # Gomb: útvonal megjelenítése
-        self.route_button = QPushButton("Útvonal megnyitása Google Maps-ben")
+        # Saját jármű konfigurálása gomb
+        self.car_button = QPushButton("Saját jármű konfigurálása…")
+        self.car_button.clicked.connect(self.on_configure_car_clicked)
+        left_layout.addWidget(self.car_button)
+
+        # Útvonal megjelenítése térképen
+        self.route_button = QPushButton("Útvonal megjelenítése térképen")
         self.route_button.clicked.connect(self.on_route_clicked)
         left_layout.addWidget(self.route_button)
+
+        # Költség tervezés (Directions API + számolás)
+        self.cost_button = QPushButton("Költség tervezés")
+        self.cost_button.clicked.connect(self.on_cost_clicked)
+        left_layout.addWidget(self.cost_button)
 
         left_layout.addStretch()
 
@@ -81,17 +148,30 @@ class MainWindow(QMainWindow):
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
         self.result_text.setPlaceholderText(
-            "Itt látod majd, hogy milyen Google Maps URLt nyitottunk meg,\n"
-            "később ide jöhetnek plusz infók az útról."
+            "Itt látod majd az útvonaladatokat, költségbecslést, stb."
         )
         right_layout.addWidget(self.result_text)
 
         main_layout.addWidget(left_panel, 1)
         main_layout.addWidget(right_panel, 2)
 
-        self.statusBar().showMessage("Add meg a honnan–hová adatokat, majd kattints az útvonal gombra.")
+        self.statusBar().showMessage("Add meg a honnan–hová adatokat, majd válassz funkciót.")
 
-    # ==== Gomb logika: Google Maps megnyitása ====
+    # --- Segéd: a comboboxból Google travelmode + felirat ---
+    def _get_travelmode(self):
+        mode_text = self.mode_combo.currentText()
+        if mode_text == "Autó":
+            return "driving", mode_text
+        elif mode_text == "Tömegközlekedés":
+            return "transit", mode_text
+        elif mode_text == "Repülő":
+            # Directions API nem tud airplane módot,
+            # driving-et használunk a távolság/idő becsléshez.
+            return "driving", mode_text
+        else:
+            return "driving", mode_text
+
+    # ==== Útvonal megjelenítése térképen ====
     def on_route_clicked(self):
         origin = self.origin_input.text().strip()
         destination = self.destination_input.text().strip()
@@ -100,20 +180,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Hiba: töltsd ki a Honnan és Hová mezőket!")
             return
 
-        # Utazási mód leképezése Google Maps travelmode-re
-        mode_text = self.mode_combo.currentText()
-        if mode_text == "Autó":
-            travelmode = "driving"
-        elif mode_text == "Tömegközlekedés":
-            travelmode = "transit"
-        elif mode_text == "Gyalog":
-            travelmode = "walking"
-        elif mode_text == "Kerékpár":
-            travelmode = "bicycling"
-        else:
-            travelmode = "driving"
+        travelmode, mode_text = self._get_travelmode()
 
-        # --- 1) Google Maps URL megnyitása böngészőben (megtartjuk) ---
         origin_enc = quote_plus(origin)
         destination_enc = quote_plus(destination)
 
@@ -123,15 +191,35 @@ class MainWindow(QMainWindow):
             f"&destination={destination_enc}"
             f"&travelmode={travelmode}"
         )
+
         webbrowser.open(url)
 
-        # --- 2) Directions API hívása részletes infókért ---
+        self.result_text.setPlainText(
+            "Útvonal megjelenítése térképen:\n\n"
+            f"Honnan: {origin}\n"
+            f"Hová: {destination}\n"
+            f"Mivel: {mode_text}\n\n"
+            f"Megnyitott Google Maps URL:\n{url}"
+        )
+        self.statusBar().showMessage("Útvonal megnyitva a Google Maps-ben.")
+
+    # ==== Költség tervezés (Directions API + számolás) ====
+    def on_cost_clicked(self):
+        origin = self.origin_input.text().strip()
+        destination = self.destination_input.text().strip()
+
+        if not origin or not destination:
+            self.statusBar().showMessage("Hiba: töltsd ki a Honnan és Hová mezőket!")
+            return
+
+        travelmode, mode_text = self._get_travelmode()
+
+        # Directions API hívása
         try:
             info = get_route_info(origin, destination, travelmode)
         except RouteError as e:
             self.result_text.setPlainText(
-                f"Nem sikerült lekérdezni az útvonal adatait:\n{e}\n\n"
-                f"Megnyitottuk a Maps-et itt:\n{url}"
+                f"Nem sikerült lekérdezni az útvonal adatait:\n{e}"
             )
             self.statusBar().showMessage("Hiba a Directions API hívásakor.")
             return
@@ -140,34 +228,148 @@ class MainWindow(QMainWindow):
         duration_min = info["duration_min"]
         traffic_duration_min = info["traffic_duration_min"]
         warnings = info["warnings"]
+        transit_segments = info.get("transit_segments") or []
 
-        # Szép formázás
         hours = int(duration_min // 60)
         mins = int(duration_min % 60)
 
         lines = []
         lines.append("Útvonal adatai (Directions API alapján):\n")
+        lines.append(f"- Honnan: {origin}")
+        lines.append(f"- Hová: {destination}")
+        lines.append(f"- Mivel: {mode_text}")
         lines.append(f"- Távolság: {distance_km:.1f} km")
-        if hours > 0:
-            lines.append(f"- Becsült idő: {hours} óra {mins} perc")
-        else:
-            lines.append(f"- Becsült idő: {mins} perc")
 
-        if traffic_duration_min is not None:
-            t_hours = int(traffic_duration_min // 60)
-            t_mins = int(traffic_duration_min % 60)
-            if t_hours > 0:
-                lines.append(f"- Forgalommal: {t_hours} óra {t_mins} perc")
+        if mode_text == "Autó":
+            if hours > 0:
+                lines.append(f"- Becsült idő: {hours} óra {mins} perc")
             else:
-                lines.append(f"- Forgalommal: {t_mins} perc")
+                lines.append(f"- Becsült idő: {mins} perc")
+
+            if traffic_duration_min is not None:
+                t_hours = int(traffic_duration_min // 60)
+                t_mins = int(traffic_duration_min % 60)
+                if t_hours > 0:
+                    lines.append(f"- Forgalommal: {t_hours} óra {t_mins} perc")
+                else:
+                    lines.append(f"- Forgalommal: {t_mins} perc")
+
+        # Autós költség csak akkor, ha autó + van saját jármű
+        if mode_text == "Autó" and self.car_config is not None:
+            cons = self.car_config["consumption_l_per_100km"]
+            price = self.car_config["fuel_price_per_liter"]
+            liters = distance_km / 100.0 * cons
+            cost = liters * price
+
+            lines.append("\nSaját jármű költségbecslés:")
+            lines.append(f"- Autó: {self.car_config['name']}")
+            lines.append(f"- Fogyasztás: {cons:.1f} l/100 km")
+            lines.append(f"- Üzemanyag ár: {price:.0f} Ft/l")
+            lines.append(f"- Becsült üzemanyag igény: {liters:.1f} liter")
+            lines.append(f"- Becsült üzemanyagköltség: {cost:,.0f} Ft".replace(",", " "))
+        elif self.mode_combo.currentText() == "Autó" and self.car_config is None:
+            lines.append("\n[Saját jármű nincs konfigurálva – az autós költségbecsléshez állítsd be a járművet.]")
+
+        # Repülő költségmodell (nagyon egyszerű becslés)
+        if mode_text == "Repülő":
+            d = distance_km
+
+            if d < 800:
+                base = 20000.0
+                per_km = 50.0
+            elif d < 2500:
+                base = 30000.0
+                per_km = 40.0
+            else:
+                base = 40000.0
+                per_km = 35.0
+
+            one_way = base + d * per_km
+            round_trip = one_way * 2.0
+
+            low_one_way = one_way * 0.7
+            high_one_way = one_way * 1.3
+            low_round = round_trip * 0.7
+            high_round = round_trip * 1.3
+
+            lines.append("\nRepülőjegy költségbecslés (becsült sáv):")
+            lines.append(f"Távolság alapú modell (nem valós árlista)")
+            lines.append(
+                f"- Odaút: ~ {low_one_way:,.0f} – {high_one_way:,.0f} Ft".replace(",", " ")
+            )
+            lines.append(
+                f"- Oda-vissza: ~ {low_round:,.0f} – {high_round:,.0f} Ft".replace(",", " ")
+            )
+
+        if mode_text == "Tömegközlekedés":
+            d = distance_km
+
+            # hosszabb az út,  olcsóbb / km
+            if d < 300:
+                base = 1000.0
+                per_km = 25.0
+            elif d < 1500:
+                base = 2000.0
+                per_km = 18.0
+            else:
+                base = 4000.0
+                per_km = 15.0
+
+            one_way = base + d * per_km
+            round_trip = one_way * 2.0
+
+            low_one_way = one_way * 0.8
+            high_one_way = one_way * 1.2
+            low_round = round_trip * 0.8
+            high_round = round_trip * 1.2
+
+            lines.append("\nTömegközlekedés költségbecslés (becsült sáv):")
+            lines.append(f"- Km alapú, egyszerű modell (busz + vonat)")
+            lines.append(
+                f"- Odaút: ~ {low_one_way:,.0f} – {high_one_way:,.0f} Ft".replace(",", " ")
+            )
+            lines.append(
+                f"- Oda-vissza: ~ {low_round:,.0f} – {high_round:,.0f} Ft".replace(",", " ")
+            )
+
+            # ==== Transit szakaszok kiírása ====
+            if transit_segments:
+                lines.append("\nTömegközlekedés részletei:")
+                for idx, seg in enumerate(transit_segments, start=1):
+                    dep_time = seg.get("departure_time")
+                    dep_stop = seg.get("departure_stop")
+                    arr_time = seg.get("arrival_time")
+                    arr_stop = seg.get("arrival_stop")
+                    line_name = seg.get("line_name")
+                    vehicle_type = seg.get("vehicle_type")
+
+                    lines.append(f"\n  Szakasz {idx}:")
+                    if dep_time or dep_stop:
+                        lines.append(
+                            f"    - Indulás:  {dep_time or 'ismeretlen idő'} – {dep_stop or 'ismeretlen megálló'}"
+                        )
+                    if arr_time or arr_stop:
+                        lines.append(
+                            f"    - Érkezés:  {arr_time or 'ismeretlen idő'} – {arr_stop or 'ismeretlen megálló'}"
+                        )
+                    if line_name or vehicle_type:
+                        vt = vehicle_type or "ISMERETLEN"
+                        lines.append(
+                            f"    - Jármű: {vt} – {line_name or 'ismeretlen járat'}"
+                        )
 
         if warnings:
             lines.append("\nFigyelmeztetések / akadályok:")
             for w in warnings:
                 lines.append(f"  • {w}")
 
-        lines.append("\nMegnyitott Google Maps URL:")
-        lines.append(url)
-
         self.result_text.setPlainText("\n".join(lines))
-        self.statusBar().showMessage("Útvonaladatok sikeresen lekérve.")
+        self.statusBar().showMessage("Költségbecslés elkészült.")
+
+    def on_configure_car_clicked(self):
+        dialog = CarConfigDialog(self, existing_config=self.car_config)
+        if dialog.exec() == QDialog.Accepted:
+            self.car_config = dialog.get_config()
+            name = self.car_config["name"]
+            self.statusBar().showMessage(f"Saját jármű beállítva: {name}")
+            self.result_text.append(f"\n[Saját jármű frissítve] {name}")
