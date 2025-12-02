@@ -11,7 +11,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox
+    QDoubleSpinBox,
+    QTabWidget,
+    QListWidget,
+    QListWidgetItem
 )
 from PySide6.QtCore import Qt
 import webbrowser
@@ -136,26 +139,74 @@ class MainWindow(QMainWindow):
 
         left_layout.addStretch()
 
-        # ==== Jobb oldal: infó / log ====
-        right_panel = QWidget(self)
-        right_layout = QVBoxLayout(right_panel)
-        right_panel.setLayout(right_layout)
+        # ==== Jobb oldal: tabok (Napló + AI ajánló) ====
+        right_tabs = QTabWidget(self)
+
+        # --- 1. fül: Napló / infók (a régi panel) ---
+        log_panel = QWidget(self)
+        log_layout = QVBoxLayout(log_panel)
 
         result_label = QLabel("Információk / napló")
         result_label.setStyleSheet("font-size: 18px; font-weight: bold;")
-        right_layout.addWidget(result_label)
+        log_layout.addWidget(result_label)
 
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
         self.result_text.setPlaceholderText(
             "Itt látod majd az útvonaladatokat, költségbecslést, stb."
         )
-        right_layout.addWidget(self.result_text)
+        log_layout.addWidget(self.result_text)
 
+        right_tabs.addTab(log_panel, "Napló")
+
+        # --- 2. fül: AI úti cél ajánló ---
+        ai_panel = QWidget(self)
+        ai_layout = QVBoxLayout(ai_panel)
+
+        ai_title = QLabel("AI úti cél ajánló")
+        ai_title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        ai_layout.addWidget(ai_title)
+
+        # Felhasználói kívánság (prompt az AI-nak)
+        self.ai_prompt = QTextEdit()
+        self.ai_prompt.setPlaceholderText(
+            "Írd le, milyen jellegű utazást szeretnél.\n"
+            "Pl.: „olasz tengerpart, közelben városokkal és kiránduló helyekkel, "
+            "ne legyen túl zsúfolt.”"
+        )
+        self.ai_prompt.setFixedHeight(120)
+        ai_layout.addWidget(self.ai_prompt)
+
+        # Gomb az AI hívására
+        self.ai_button = QPushButton("Ajánlások lekérése")
+        self.ai_button.clicked.connect(self.on_ai_request_clicked)
+        ai_layout.addWidget(self.ai_button)
+
+        # Lista az ajánlott úti céloknak
+        self.ai_list = QListWidget()
+        self.ai_list.itemSelectionChanged.connect(self.on_ai_item_selected)
+        ai_layout.addWidget(self.ai_list)
+
+        # Részletek kijelölés után
+        self.ai_details = QTextEdit()
+        self.ai_details.setReadOnly(True)
+        self.ai_details.setPlaceholderText(
+            "Itt jelennek meg a kiválasztott úti cél részletei."
+        )
+        ai_layout.addWidget(self.ai_details)
+
+        right_tabs.addTab(ai_panel, "AI ajánló")
+
+        # --- jobb oldal hozzáadása a fő layouthoz ---
         main_layout.addWidget(left_panel, 1)
-        main_layout.addWidget(right_panel, 2)
+        main_layout.addWidget(right_tabs, 2)
 
-        self.statusBar().showMessage("Add meg a honnan–hová adatokat, majd válassz funkciót.")
+        self.statusBar().showMessage(
+            "Add meg a honnan–hová adatokat, vagy próbáld ki az AI úti cél ajánlót."
+        )
+
+        # ide mentjük az AI-tól kapott találatokat (lista dict-ekkel)
+        self.ai_destinations = []
 
     # --- Segéd: a comboboxból Google travelmode + felirat ---
     def _get_travelmode(self):
@@ -373,3 +424,66 @@ class MainWindow(QMainWindow):
             name = self.car_config["name"]
             self.statusBar().showMessage(f"Saját jármű beállítva: {name}")
             self.result_text.append(f"\n[Saját jármű frissítve] {name}")
+    # ==== AI úti cél ajánló – ajánlások lekérése ====
+    def on_ai_request_clicked(self):
+        text = self.ai_prompt.toPlainText().strip()
+        if not text:
+            self.statusBar().showMessage("Írd le, milyen utazást szeretnél az AI-nak.")
+            return
+
+        # --- Itt később a HF API-t fogjuk hívni ---
+        # from app.ai_recommend import suggest_destinations
+        # self.ai_destinations = suggest_destinations(text)
+
+        # Egyelőre DUMMY adatok, hogy lásd a működést:
+        self.ai_destinations = [
+            {
+                "name": "Bari",
+                "country": "Olaszország",
+                "short_description": "Dél-olasz kikötőváros, közel szép tengerpartokkal "
+                                     "és kis városokkal (Polignano a Mare, Monopoli).",
+                "tags": ["tengerpart", "városnézés", "kirándulás"],
+            },
+            {
+                "name": "Trieste",
+                "country": "Olaszország",
+                "short_description": "Tengerparti város az olasz–szlovén határnál, "
+                                     "közel hegyekkel és kiránduló helyekkel.",
+                "tags": ["tengerpart", "városnézés"],
+            },
+        ]
+
+        # Mezők clearelés + lista feltöltése
+        self.ai_list.clear()
+        self.ai_details.clear()
+
+        for dest in self.ai_destinations:
+            item = QListWidgetItem(f"{dest['name']} ({dest['country']})")
+            self.ai_list.addItem(item)
+
+        # Promptot is ürítjük, hogy 'új lappal' kezdjen a user
+        self.ai_prompt.clear()
+
+        self.statusBar().showMessage("AI ajánlások frissítve.")
+
+    # ==== AI úti cél ajánló – listaelem kiválasztása ====
+    def on_ai_item_selected(self):
+        idx = self.ai_list.currentRow()
+        if idx < 0 or idx >= len(self.ai_destinations):
+            return
+
+        dest = self.ai_destinations[idx]
+
+        lines = [
+            f"Név: {dest.get('name')}",
+            f"Ország: {dest.get('country')}",
+            "",
+            dest.get("short_description", ""),
+        ]
+
+        tags = dest.get("tags")
+        if tags:
+            lines.append("")
+            lines.append("Címkék: " + ", ".join(tags))
+
+        self.ai_details.setPlainText("\n".join(lines))
