@@ -12,14 +12,49 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QTabWidget,
-    QListWidget,
-    QListWidgetItem
+    QTabWidget
 )
 from PySide6.QtCore import Qt
 import webbrowser
 from urllib.parse import quote_plus
 from app.google_routes import get_route_info, RouteError
+from app.ai_recommend import (
+    ask_travel_ai,
+    AIRecommendError,
+    set_hf_token,
+)
+
+class HuggingFaceTokenDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("HuggingFace token beállítása")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        label = QLabel(
+            "Add meg a HuggingFace API tokenedet.\n"
+            "A token csak a program futása alatt lesz használva, "
+            "fájlba nem mentjük."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        form = QFormLayout()
+        self.token_input = QLineEdit()
+        # ha nem akarod, hogy látszódjon a token:
+        self.token_input.setEchoMode(QLineEdit.Password)
+        form.addRow("HF API token:", self.token_input)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_token(self) -> str:
+        return self.token_input.text().strip()
 
 
 class CarConfigDialog(QDialog):
@@ -142,6 +177,13 @@ class MainWindow(QMainWindow):
         # ==== Jobb oldal: tabok (Napló + AI ajánló) ====
         right_tabs = QTabWidget(self)
 
+        # ==== Menü: Beállítások → HuggingFace token beállítása ====
+        menu_bar = self.menuBar()
+        settings_menu = menu_bar.addMenu("Beállítások")
+
+        token_action = settings_menu.addAction("HuggingFace token beállítása…")
+        token_action.triggered.connect(self.on_set_hf_token)
+
         # --- 1. fül: Napló / infók (a régi panel) ---
         log_panel = QWidget(self)
         log_layout = QVBoxLayout(log_panel)
@@ -182,18 +224,14 @@ class MainWindow(QMainWindow):
         self.ai_button.clicked.connect(self.on_ai_request_clicked)
         ai_layout.addWidget(self.ai_button)
 
-        # Lista az ajánlott úti céloknak
-        self.ai_list = QListWidget()
-        self.ai_list.itemSelectionChanged.connect(self.on_ai_item_selected)
-        ai_layout.addWidget(self.ai_list)
-
-        # Részletek kijelölés után
+        # AI válasz – egy nagy textbox
         self.ai_details = QTextEdit()
         self.ai_details.setReadOnly(True)
         self.ai_details.setPlaceholderText(
-            "Itt jelennek meg a kiválasztott úti cél részletei."
+            "Itt jelenik meg az AI által javasolt úti célok listája és leírása."
         )
-        ai_layout.addWidget(self.ai_details)
+        # 1-es stretch, hogy szépen kitöltse a maradék helyet
+        ai_layout.addWidget(self.ai_details, 1)
 
         right_tabs.addTab(ai_panel, "AI ajánló")
 
@@ -204,9 +242,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Add meg a honnan–hová adatokat, vagy próbáld ki az AI úti cél ajánlót."
         )
-
-        # ide mentjük az AI-tól kapott találatokat (lista dict-ekkel)
-        self.ai_destinations = []
 
     # --- Segéd: a comboboxból Google travelmode + felirat ---
     def _get_travelmode(self):
@@ -424,6 +459,29 @@ class MainWindow(QMainWindow):
             name = self.car_config["name"]
             self.statusBar().showMessage(f"Saját jármű beállítva: {name}")
             self.result_text.append(f"\n[Saját jármű frissítve] {name}")
+
+
+    def on_set_hf_token(self):
+        """Menüből hívható: HF token """
+        dialog = HuggingFaceTokenDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            token = dialog.get_token()
+            if not token:
+                self.statusBar().showMessage("Nem adtál meg tokent.")
+                return
+
+            # Beállítjuk az AI modulban (memóriában, fájl nélkül)
+            try:
+                set_hf_token(token)
+            except Exception as e:
+                self.statusBar().showMessage(f"Hiba a token beállításakor: {e}")
+                return
+
+            self.statusBar().showMessage("HuggingFace token beállítva. AI ajánló használatra kész.")
+            # opcionálisan kiírhatod az AI tabon is:
+            if hasattr(self, "ai_details"):
+                self.ai_details.append("\n[HF token frissítve – AI ajánló engedélyezve]")
+
     # ==== AI úti cél ajánló – ajánlások lekérése ====
     def on_ai_request_clicked(self):
         text = self.ai_prompt.toPlainText().strip()
@@ -431,59 +489,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Írd le, milyen utazást szeretnél az AI-nak.")
             return
 
-        # --- Itt később a HF API-t fogjuk hívni ---
-        # from app.ai_recommend import suggest_destinations
-        # self.ai_destinations = suggest_destinations(text)
-
-        # Egyelőre DUMMY adatok, hogy lásd a működést:
-        self.ai_destinations = [
-            {
-                "name": "Bari",
-                "country": "Olaszország",
-                "short_description": "Dél-olasz kikötőváros, közel szép tengerpartokkal "
-                                     "és kis városokkal (Polignano a Mare, Monopoli).",
-                "tags": ["tengerpart", "városnézés", "kirándulás"],
-            },
-            {
-                "name": "Trieste",
-                "country": "Olaszország",
-                "short_description": "Tengerparti város az olasz–szlovén határnál, "
-                                     "közel hegyekkel és kiránduló helyekkel.",
-                "tags": ["tengerpart", "városnézés"],
-            },
-        ]
-
-        # Mezők clearelés + lista feltöltése
-        self.ai_list.clear()
+        # előző válasz törlése
         self.ai_details.clear()
 
-        for dest in self.ai_destinations:
-            item = QListWidgetItem(f"{dest['name']} ({dest['country']})")
-            self.ai_list.addItem(item)
-
-        # Promptot is ürítjük, hogy 'új lappal' kezdjen a user
-        self.ai_prompt.clear()
-
-        self.statusBar().showMessage("AI ajánlások frissítve.")
-
-    # ==== AI úti cél ajánló – listaelem kiválasztása ====
-    def on_ai_item_selected(self):
-        idx = self.ai_list.currentRow()
-        if idx < 0 or idx >= len(self.ai_destinations):
+        try:
+            answer = ask_travel_ai(text)
+        except AIRecommendError as e:
+            self.ai_details.setPlainText(f"Hiba az AI hívásakor:\n{e}")
+            self.statusBar().showMessage("Hiba az AI hívásakor.")
             return
 
-        dest = self.ai_destinations[idx]
+        # teljes válasz be a textboxba
+        self.ai_details.setPlainText(answer)
 
-        lines = [
-            f"Név: {dest.get('name')}",
-            f"Ország: {dest.get('country')}",
-            "",
-            dest.get("short_description", ""),
-        ]
+        # prompt ürítése
+        self.ai_prompt.clear()
 
-        tags = dest.get("tags")
-        if tags:
-            lines.append("")
-            lines.append("Címkék: " + ", ".join(tags))
-
-        self.ai_details.setPlainText("\n".join(lines))
+        self.statusBar().showMessage("AI válasz megérkezett.")
